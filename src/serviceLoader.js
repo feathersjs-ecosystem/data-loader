@@ -6,10 +6,13 @@ const {
   defaultCacheKeyFn,
   uniqueKeys,
   uniqueResults,
-  uniqueResultsMulti
+  uniqueResultsMulti,
+  _
 } = require('./utils')
 
-const createDataLoader = ({ service, key, loaderOptions, multi, method, params = {} }) => {
+const filters = ['$limit', '$skip', '$sort']
+
+const createDataLoader = ({ service, key, loaderOptions, multi, method, params }) => {
   const serviceMethod = method === '_load' ? '_find' : 'find'
 
   if (!service[serviceMethod]) {
@@ -30,199 +33,159 @@ const createDataLoader = ({ service, key, loaderOptions, multi, method, params =
         [key]: { $in: uniqueKeys(keys) }
       }
     }
-    delete loaderParams.query.$limit
     return service[serviceMethod](loaderParams).then((result) => getResults(keys, result, key))
   }, loaderOptions)
 }
 
+const stringifyKey = (options, cacheParamsFn) => {
+  return stableStringify({
+    ...options,
+    params: cacheParamsFn(options.params)
+  })
+}
+
 module.exports = class ServiceLoader {
-  constructor({ app, serviceName, cacheParamsFn, cacheMap, ...loaderOptions }) {
-    this.cacheMap = cacheMap || new Map()
-    this.loaders = new Map()
-    const service = app.service(serviceName)
+  constructor({ app, path, cacheParamsFn, cacheMap, ...loaderOptions }, state) {
+    const service = app.service(path)
     this.options = {
       app,
-      serviceName,
+      path,
       service,
       key: service.options && service.options.id || 'id',
       cacheParamsFn: cacheParamsFn || defaultCacheParamsFn,
-      loaderOptions: {
-        cacheKeyFn: defaultCacheKeyFn,
-        ...loaderOptions
-      }
+      loaderOptions: _.assign({ cacheKeyFn: defaultCacheKeyFn }, loaderOptions),
+      loaders: new Map(),
+      cacheMap: cacheMap || new Map()
     }
+    this.state = state || {}
   }
 
   async exec({ cacheParamsFn, ...options }) {
-    const { service, loaderOptions } = this.options
+    const { path, service, loaderOptions, cacheMap, loaders } = this.options
+    cacheParamsFn = cacheParamsFn || this.options.cacheParamsFn
 
-    options = {
-      id: null,
-      key: this.options.key,
-      params: null,
-      multi: false,
-      method: 'load',
-      ...options
-    }
-
-    if (['get', '_get', 'find', '_find'].includes(options.method)) {
-      const cacheKey = this.stringifyKey(options, cacheParamsFn)
-
-      const cachedResult = await this.cacheMap.get(cacheKey)
-
-      if (cachedResult) {
-        return cachedResult
-      }
-
-      const result = ['get', '_get'].includes(options.method)
-        ? await service[options.method](options.id, options.params)
-        : await service[options.method](options.params)
-
-      await this.cacheMap.set(cacheKey, result)
-
-      return result
-    }
-
-    // stableStringify does not sort arrays on purpose because
-    // array order matters in most cases. In this case, the
-    // order of ids does not matter to the load function but
-    // does to the cache key, thats why these are sorted.
-    const sortedId = Array.isArray(options.id) ? [...options.id].sort() : options.id
-
-    const cacheKey = this.stringifyKey(
+    options = _.assign(
+      {
+        id: null,
+        key: this.options.key,
+        params: {},
+        multi: false,
+        method: 'load'
+      },
       {
         ...options,
-        id: sortedId
-      },
-      cacheParamsFn
+        path
+      }
     )
 
-    const cachedResult = await this.cacheMap.get(cacheKey)
+    if (['get', '_get', 'find', '_find'].includes(options.method)) {
+      const cacheKey = stringifyKey(options, cacheParamsFn)
 
-    if (cachedResult) {
-      return cachedResult
+      const cachedPromise = await cacheMap.get(cacheKey)
+
+      if (cachedPromise) {
+        return cachedPromise
+      }
+
+      const promise = ['get', '_get'].includes(options.method)
+        ? service[options.method](options.id, options.params)
+        : service[options.method](options.params)
+
+      await cacheMap.set(cacheKey, promise)
+
+      return promise
     }
 
-    const loaderKey = this.stringifyKey(
-      {
-        key: options.key,
-        multi: options.multi,
-        method: options.method,
-        params: options.params
-      },
-      cacheParamsFn
-    )
+    if (options.params.query && _.has(options.params.query, filters)) {
+      throw new GeneralError('Loader `load()` method cannot contain ${filters} in the query')
+    }
 
-    const dataLoader =
-      this.loaders.get(loaderKey) ||
-      createDataLoader({
-        key: options.key,
-        multi: options.multi,
-        method: options.method,
-        params: options.params,
+    const cacheKey = stringifyKey(options, cacheParamsFn)
+
+    const cachedPromise = await cacheMap.get(cacheKey)
+
+    if (cachedPromise) {
+      return cachedPromise
+    }
+
+    const loaderConfig = {
+      key: options.key,
+      multi: options.multi,
+      method: options.method,
+      params: options.params
+    }
+
+    const loaderKey = stringifyKey(loaderConfig, cacheParamsFn)
+
+    let dataLoader = loaders.get(loaderKey)
+
+    if (!dataLoader) {
+      dataLoader = createDataLoader({
         service,
-        loaderOptions
+        loaderOptions,
+        ...loaderConfig
       })
 
-    this.loaders.set(loaderKey, dataLoader)
+      loaders.set(loaderKey, dataLoader)
+    }
 
-    const result = Array.isArray(sortedId)
-      ? await dataLoader.loadMany(sortedId)
-      : await dataLoader.load(sortedId)
+    const promise = Array.isArray(options.id) ? dataLoader.loadMany(options.id) : dataLoader.load(options.id)
 
-    await this.cacheMap.set(cacheKey, result)
+    await cacheMap.set(cacheKey, promise)
 
-    return result
+    return promise
   }
 
-  get(id, params, cacheParamsFn) {
-    return this.exec({ method: 'get', id, params, cacheParamsFn })
+  get(id, params) {
+    return this.exec({ ...this.state, method: 'get', id, params })
   }
 
-  _get(id, params, cacheParamsFn) {
-    return this.exec({ method: '_get', id, params, cacheParamsFn })
+  _get(id, params) {
+    return this.exec({ ...this.state, method: '_get', id, params })
   }
 
-  find(params, cacheParamsFn) {
-    return this.exec({ method: 'find', params, cacheParamsFn })
+  find(params) {
+    return this.exec({ ...this.state, method: 'find', params })
   }
 
-  _find(params, cacheParamsFn) {
-    return this.exec({ method: '_find', params, cacheParamsFn })
+  _find(params) {
+    return this.exec({ ...this.state, method: '_find', params })
   }
 
-  load(id, params, cacheParamsFn) {
-    return this.exec({ method: 'load', id, params, cacheParamsFn })
+  load(id, params) {
+    return this.exec({ ...this.state, method: 'load', id, params })
   }
 
-  _load(id, params, cacheParamsFn) {
-    return this.exec({ method: '_load', id, params, cacheParamsFn })
+  _load(id, params) {
+    return this.exec({ ...this.state, method: '_load', id, params })
   }
 
   key(key) {
-    return {
-      load: (id, params, cacheParamsFn) => {
-        return this.exec({
-          method: 'load',
-          id,
-          key,
-          params,
-          cacheParamsFn
-        })
-      },
-      _load: (id, params, cacheParamsFn) => {
-        return this.exec({
-          method: '_load',
-          id,
-          key,
-          params,
-          cacheParamsFn
-        })
-      }
-    }
+    return new ServiceLoader(this.options, { key })
   }
 
   multi(key) {
-    return {
-      load: (id, params, cacheParamsFn) => {
-        return this.exec({
-          method: 'load',
-          id,
-          key,
-          params,
-          cacheParamsFn,
-          multi: true
-        })
-      },
-      _load: (id, params, cacheParamsFn) => {
-        return this.exec({
-          method: '_load',
-          id,
-          key,
-          params,
-          cacheParamsFn,
-          multi: true
-        })
-      }
-    }
-  }
-
-  stringifyKey(options, cacheParamsFn = this.options.cacheParamsFn) {
-    return stableStringify({
-      ...options,
-      serviceName: this.options.serviceName,
-      params: cacheParamsFn(options.params)
-    })
+    return new ServiceLoader(this.options, { key, multi: true })
   }
 
   async clear() {
-    const { serviceName } = this.options
-    this.loaders.clear()
+    const { path, loaders, cacheMap } = this.options
+    loaders.clear()
     const promises = []
-    for await (const cacheKey of this.cacheMap.keys()) {
+    // TODO: This could be a redis store or some other
+    // async storage. That's why there is this for/await
+    // iterator used to step over all the keys in a collection.
+    // Is it a good idea to just be pushing all the deletes into
+    // one Promise.all() after? Instead, we may want to call
+    // the delete in the iteration. But that would be slower.
+    // Also note that we don't just clear the whole cache
+    // and only delete the keys that match the path because
+    // the user may have shared the cacheMap with other
+    // services.
+    for await (const cacheKey of cacheMap.keys()) {
       const parsedKey = JSON.parse(cacheKey)
-      if (parsedKey.serviceName === serviceName) {
-        promises.push(this.cacheMap.delete(cacheKey))
+      if (parsedKey.path === path) {
+        promises.push(cacheMap.delete(cacheKey))
       }
     }
     await Promise.all(promises)

@@ -2,18 +2,22 @@ const BaseServiceLoader = require('./serviceLoader')
 
 module.exports = class AppLoader {
   constructor({ app, services = {}, ...loaderOptions }) {
-    this.options = { app, services, loaderOptions }
-    this.loaders = new Map()
+    this.options = {
+      app,
+      services,
+      loaderOptions,
+      loaders: new Map()
+    }
   }
 
-  service(serviceName) {
+  service(path) {
     const { app } = this.options
     const { ServiceLoader, ...loaderOptions } = {
       ServiceLoader: BaseServiceLoader,
       ...this.options.loaderOptions,
-      ...(this.options.services[serviceName] || {})
+      ...(this.options.services[path] || {})
     }
-    const cachedLoader = this.loaders.get(serviceName)
+    const cachedLoader = this.options.loaders.get(path)
 
     if (cachedLoader) {
       return cachedLoader
@@ -21,22 +25,23 @@ module.exports = class AppLoader {
 
     const loader = new ServiceLoader({
       ...loaderOptions,
-      serviceName,
+      path,
       app
     })
 
-    this.loaders.set(serviceName, loader)
+    this.options.loaders.set(path, loader)
 
     return loader
   }
 
   async clear() {
+    const { loaders } = this.options
     const promises = []
-    this.loaders.forEach((loader) => {
-      promises.push(loader.cacheMap.clear())
+    loaders.forEach((loader) => {
+      promises.push(loader.clear())
     })
     await Promise.all(promises)
-    this.loaders.clear()
+    loaders.clear()
     return this
   }
 }

@@ -1,11 +1,49 @@
 const { GeneralError } = require('@feathersjs/errors')
 
-const isObject = (obj) => {
-  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+const _ = {
+  isObject: (obj) => {
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+      return false
+    }
+    return Object.getPrototypeOf(obj) === Object.prototype
+  },
+  assign: (target, source) => {
+    const result = { ...target }
+    const keys = Object.keys(source)
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index]
+      if (source[key] !== undefined) {
+        result[key] = source[key]
+      }
+    }
+    return result
+  },
+  omit: (source, keys) => {
+    const result = { ...source }
+    for (let index = 0; index < keys.length; index++) {
+      delete result[keys[index]]
+    }
+    return result
+  },
+  pick: (source, keys) => {
+    return keys.reduce((result, key) => {
+      if (source[key] !== undefined) {
+        result[key] = source[key]
+      }
+      return result
+    }, {})
+  },
+  has: (source, keys) => {
+    for (let index = 0; index < keys.length; index++) {
+      if (Object.prototype.hasOwnProperty.call(source, keys[index])) {
+        return true
+      }
+    }
     return false
   }
-  return Object.getPrototypeOf(obj) === Object.prototype
 }
+
+module.exports._ = _
 
 module.exports.stableStringify = (object) => {
   return JSON.stringify(object, (key, value) => {
@@ -15,7 +53,7 @@ module.exports.stableStringify = (object) => {
       )
     }
 
-    if (isObject(value)) {
+    if (_.isObject(value)) {
       const keys = Object.keys(value).sort()
       const result = {}
       for (let index = 0, length = keys.length; index < length; ++index) {
